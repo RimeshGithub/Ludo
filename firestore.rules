@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function roomPath(code) { return /databases/$(database)/documents/ludo_rooms/$(code); }
+    function room(code) { return get(roomPath(code)); }
+    function isHost(code) { return signedIn() && room(code).data.hostUid == request.auth.uid; }
+    // A finished or closed room may be cleaned up by whoever is left.
+    function ended(code) { return room(code).data.status in ['finished', 'closed']; }
+    function myMemberAfter(code) {
+      return existsAfter(/databases/$(database)/documents/ludo_rooms/$(code)/members/$(request.auth.uid));
+    }
+
+    // Online Ludo. The host's device is the authority: only the host writes
+    // the game state, guests only append small "intents" and take / free a seat.
+    match /ludo_rooms/{code} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+                    && request.resource.data.hostUid == request.auth.uid
+                    && request.resource.data.status == 'lobby'
+                    && request.resource.data.playerCount in [2, 3, 4, 5, 6]
+                    && request.resource.data.memberCount == 1;
+
+      allow update: if signedIn() && (
+        // The host controls the room.
+        (resource.data.hostUid == request.auth.uid
+          && request.resource.data.hostUid == resource.data.hostUid
+          // While a game runs, the host's state writes obey the same +1 rule
+          // as everybody else's (compare-and-set without a transaction).
+          // Writes that leave the version alone (closing the room) still pass.
+          && (resource.data.status != 'playing'
+              || request.resource.data.version == resource.data.version + 1
+              || request.resource.data.version == resource.data.version))
+        // Online game in progress: any seated player publishes the next state,
+        // but only on top of the version everyone has seen (+1 exactly).
+        || (resource.data.status == 'playing'
+          && exists(/databases/$(database)/documents/ludo_rooms/$(code)/members/$(request.auth.uid))
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state', 'version', 'status'])
+          && request.resource.data.version == resource.data.version + 1)
+        // A guest taking a free seat: +1, never above playerCount, and only
+        // together with creating their own member document.
+        || (resource.data.status == 'lobby'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberCount'])
+          && request.resource.data.memberCount == resource.data.memberCount + 1
+          && request.resource.data.memberCount <= resource.data.playerCount
+          && myMemberAfter(code))
+        // A guest freeing their seat: -1 together with deleting their member document.
+        || (resource.data.status == 'lobby'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberCount'])
+          && request.resource.data.memberCount == resource.data.memberCount - 1
+          && !myMemberAfter(code))
+      );
+      // Deleted by the host, or by the last player out once the game is over.
+      allow delete: if signedIn()
+                    && (resource.data.hostUid == request.auth.uid
+                        || resource.data.status in ['finished', 'closed']);
+
+      match /members/{uid} {
+        allow read: if signedIn();
+        // getAfter: the room may be created in the same transaction.
+        // The host may also seat bots (ids start with "bot_").
+        allow create, update: if signedIn()
+                              && getAfter(roomPath(code)).data.status == 'lobby'
+                              && request.resource.data.name is string
+                              && request.resource.data.name.size() <= 12
+                              && (request.auth.uid == uid
+                                  || (isHost(code)
+                                      && uid.matches('bot_.*')
+                                      && request.resource.data.bot == true
+                                      && request.resource.data.level in [0, 1, 2]));
+        allow delete: if signedIn() && (request.auth.uid == uid || isHost(code) || ended(code));
+      }
+
+      // Quick chat: one document per player, overwritten by every new message
+      // (so a room never collects chat history). Only the player themselves can
+      // write it, only while the game runs, and only a short catalogue id.
+      match /chat/{uid} {
+        allow read: if signedIn();
+        allow create, update: if signedIn()
+                              && request.auth.uid == uid
+                              && room(code).data.status in ['playing', 'finished']
+                              && exists(/databases/$(database)/documents/ludo_rooms/$(code)/members/$(uid))
+                              && request.resource.data.keys().hasOnly(['item', 'n'])
+                              && request.resource.data.keys().hasAll(['item', 'n'])
+                              && request.resource.data.item is string
+                              && request.resource.data.item.size() > 0
+                              && request.resource.data.item.size() <= 32
+                              && request.resource.data.n is int;
+        allow delete: if signedIn() && (request.auth.uid == uid || isHost(code) || ended(code));
+      }
+
+      match /intents/{id} {
+        allow create: if signedIn()
+                      && request.resource.data.uid == request.auth.uid
+                      && request.resource.data.type in ['roll', 'move'];
+        allow read, delete: if isHost(code) || (signedIn() && ended(code));
+      }
+    }
+  }
+}
